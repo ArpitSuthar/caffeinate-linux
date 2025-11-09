@@ -1,0 +1,258 @@
+#!/bin/bash
+
+# Linux equivalent of macOS caffeinate
+# Supports: -d, -i, -s, -u, -t, -w, -v
+# Excludes: -m (disk sleep prevention)
+# Battery-aware, systemd-native, resource-light
+
+set -euo pipefail
+
+readonly PROGNAME=$(basename "$0")
+readonly PLACEHOLDER_SLEEP_CMD="sleep 86400"
+
+# Globals
+INHIBIT_WHAT=()
+DBUS_ACTIONS=()
+TIMEOUT_SEC=0
+WAIT_PID=0
+CMD_ARGS=()
+SIMULATE_USER=false
+AC_REQUIRED=false
+ON_AC=true
+VERBOSE=false
+
+# --- Helpers ---
+log_info() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo >&2 "[INFO] $*"
+    fi
+}
+
+log_warn() {
+    echo >&2 "Warning: $*"
+}
+
+check_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo >&2 "$PROGNAME: required tool '$1' not found"
+        exit 1
+    fi
+}
+
+check_ac_power() {
+    ON_AC=false
+    if command -v upower >/dev/null 2>&1; then
+        local ac_path
+        ac_path=$(upower -e 2>/dev/null | grep -E '/line_power_?AC' | head -n1)
+        if [[ -n "$ac_path" ]] && upower -i "$ac_path" 2>/dev/null | grep -q "online.*yes"; then
+            ON_AC=true
+            return
+        fi
+    fi
+    for ac in /sys/class/power_supply/AC*/online /sys/class/power_supply/ADP*/online; do
+        if [[ -f "$ac" ]] && [[ "$(cat "$ac")" == "1" ]]; then
+            ON_AC=true
+            return
+        fi
+    done
+}
+
+has_gui_session() {
+    [[ -n "${XDG_SESSION_TYPE:-}" && "${XDG_SESSION_TYPE}" != "tty" ]] || \
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] || \
+    [[ -n "${DISPLAY:-}" ]]
+}
+
+simulate_user_activity() {
+    if ! has_gui_session; then
+        return
+    fi
+    if command -v gdbus >/dev/null 2>&1; then
+        gdbus call --session \
+            --dest org.gnome.ScreenSaver \
+            --object-path /org/gnome/ScreenSaver \
+            --method org.gnome.ScreenSaver.SimulateUserActivity \
+            >/dev/null 2>&1 && return
+    fi
+    if command -v dbus-send >/dev/null 2>&1; then
+        dbus-send --session --type=method_call \
+            --dest=org.freedesktop.ScreenSaver \
+            /ScreenSaver org.freedesktop.ScreenSaver.SimulateUserActivity \
+            >/dev/null 2>&1 && return
+    fi
+    log_warn "Could not simulate user activity (GNOME/KDE not detected)."
+}
+
+inhibit_display_sleep() {
+    if has_gui_session; then
+        simulate_user_activity
+    fi
+}
+
+parse_args() {
+    local OPTIND opt
+    while getopts "disuht:w:v" opt; do
+        case "$opt" in
+            d) DBUS_ACTIONS+=("display") ;;
+            i) INHIBIT_WHAT+=("idle") ;;
+            s) INHIBIT_WHAT+=("sleep"); AC_REQUIRED=true ;;
+            u) SIMULATE_USER=true; DBUS_ACTIONS+=("user") ;;
+            t)
+                if [[ "$OPTARG" =~ ^[0-9]+$ ]] && (( OPTARG > 0 )); then
+                    TIMEOUT_SEC="$OPTARG"
+                else
+                    echo >&2 "$PROGNAME: invalid timeout: $OPTARG"
+                    exit 1
+                fi
+                ;;
+            w)
+                if [[ "$OPTARG" =~ ^[0-9]+$ ]] && kill -0 "$OPTARG" 2>/dev/null; then
+                    WAIT_PID="$OPTARG"
+                else
+                    echo >&2 "$PROGNAME: invalid or non-existent PID: $OPTARG"
+                    exit 1
+                fi
+                ;;
+            v) VERBOSE=true ;;
+            h)
+                cat <<EOF
+Usage: $PROGNAME [-disuv] [-t timeout] [-w pid] [utility [args...]]
+
+Prevent the system from sleeping on behalf of a utility.
+
+Flags:
+  -d      Prevent the display from sleeping.
+  -i      Prevent the system from idle sleeping.
+  -s      Prevent the system from sleeping (AC power only).
+  -u      Simulate user activity (wakes display, resets idle timer).
+  -t N    Timeout in seconds (ignored if command or -w is used).
+  -w PID  Wait for process PID to exit (ignores -t).
+  -v      Verbose mode.
+  -h      Show this help.
+
+Note: -t has no effect when running a command or using -w.
+      -m (disk sleep) is not supported on Linux.
+
+Examples:
+  $PROGNAME                      # Prevent idle sleep until exit
+  $PROGNAME -t 1800              # Keep awake for 30 minutes
+  $PROGNAME -u -t 60             # Simulate activity for 60s
+  $PROGNAME -i make              # Run 'make' with idle sleep prevented
+  $PROGNAME -s -w 1234           # Prevent sleep (if on AC) until PID 1234 exits
+EOF
+                exit 0
+                ;;
+            *)
+                exit 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    CMD_ARGS=("$@")
+}
+
+wait_for_pid() {
+    local pid="$1"
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 2
+    done
+}
+
+main() {
+    parse_args "$@"
+
+    if [[ ${#INHIBIT_WHAT[@]} -eq 0 ]] && [[ ${#CMD_ARGS[@]} -eq 0 ]] && [[ $WAIT_PID -eq 0 ]]; then
+        INHIBIT_WHAT=("idle")
+    fi
+
+    if [[ "$AC_REQUIRED" == true ]]; then
+        check_ac_power
+        if [[ "$ON_AC" == false ]]; then
+            log_warn "On battery: ignoring -s (full sleep prevention)."
+            INHIBIT_WHAT=("${INHIBIT_WHAT[@]/sleep}")
+            if [[ ${#INHIBIT_WHAT[@]} -eq 0 ]] && [[ ${#CMD_ARGS[@]} -eq 0 ]] && [[ $WAIT_PID -eq 0 ]]; then
+                echo "$PROGNAME: nothing to do."
+                exit 0
+            fi
+        fi
+    fi
+
+    if [[ "$SIMULATE_USER" == true ]]; then
+        log_info "Simulating user activity (display wake + idle reset)"
+        simulate_user_activity
+    fi
+
+    if [[ " ${DBUS_ACTIONS[*]} " == *" display "* ]]; then
+        log_info "Inhibiting display sleep (best-effort)"
+        inhibit_display_sleep
+    fi
+
+    inhibit_cmd=()
+    if [[ ${#INHIBIT_WHAT[@]} -gt 0 ]]; then
+        IFS=,; what_str="${INHIBIT_WHAT[*]}"; unset IFS
+        inhibit_cmd=( systemd-inhibit --mode=block --what="$what_str" )
+        log_info "Inhibiting: $what_str"
+    fi
+
+    local mode="idle"
+    local timeout_used=false
+    if [[ ${#CMD_ARGS[@]} -gt 0 ]]; then
+        mode="command"
+        if (( TIMEOUT_SEC > 0 )); then
+            log_info "-t ignored because a command was provided"
+        fi
+        TIMEOUT_SEC=0
+    elif [[ $WAIT_PID -gt 0 ]]; then
+        mode="waitpid"
+        if (( TIMEOUT_SEC > 0 )); then
+            log_info "-t ignored because -w was used"
+        fi
+        TIMEOUT_SEC=0
+    else
+        timeout_used=true
+    fi
+
+    if [[ "$mode" == "command" ]]; then
+        full_cmd=( "${inhibit_cmd[@]}" "${CMD_ARGS[@]}" )
+    else
+        placeholder_cmd=( $PLACEHOLDER_SLEEP_CMD )
+        if [[ ${#inhibit_cmd[@]} -gt 0 ]]; then
+            full_cmd=( "${inhibit_cmd[@]}" "${placeholder_cmd[@]}" )
+        else
+            full_cmd=( "${placeholder_cmd[@]}" )
+        fi
+    fi
+
+    cleanup() {
+        pkill -P $$ -f "$PLACEHOLDER_SLEEP_CMD" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    if [[ "$mode" == "command" ]]; then
+        if ! "${full_cmd[@]}"; then
+            log_warn "Command or systemd-inhibit failed (exit code: $?)"
+        fi
+    elif [[ "$mode" == "waitpid" ]]; then
+        "${full_cmd[@]}" &
+        wait_for_pid "$WAIT_PID"
+    else
+        if (( TIMEOUT_SEC > 0 )); then
+            if command -v timeout >/dev/null 2>&1; then
+                timeout "$TIMEOUT_SEC" "${full_cmd[@]}" 2>/dev/null || true
+            else
+                log_info "Using manual sleep fallback (timeout not available)"
+                "${full_cmd[@]}" &
+                sleep "$TIMEOUT_SEC"
+                cleanup
+            fi
+        else
+            "${full_cmd[@]}"
+        fi
+    fi
+}
+
+check_tool systemd-inhibit
+check_tool grep
+check_tool sleep
+
+main "$@"

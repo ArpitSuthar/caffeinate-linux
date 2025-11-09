@@ -1,0 +1,83 @@
+.TH CAFFEINATE 1 "November 2025" "Linux" "User Commands"
+.SH NAME
+caffeinate \- prevent the system from sleeping on behalf of a utility
+.SH SYNOPSIS
+.B caffeinate
+[\fB\-disuv\fR] [\fB\-t\fR \fItimeout\fR] [\fB\-w\fR \fIpid\fR] [\fIutility\fR [\fIargs\fR...]]
+.SH DESCRIPTION
+\fBcaffeinate\fR creates power assertions to prevent the system, display, or both from sleeping.
+It is a Linux reimplementation of macOS's \fBcaffeinate\fR command, built using systemd and D-Bus.
+.PP
+If no utility is specified, \fBcaffeinate\fR prevents idle sleep indefinitely until terminated.
+.SH OPTIONS
+.TP
+\fB\-d\fR
+Prevent the display from sleeping (best-effort via D-Bus screen activity simulation).
+.TP
+\fB\-i\fR
+Prevent the system from idle sleeping (e.g., suspend due to inactivity).
+.TP
+\fB\-s\fR
+Prevent the system from sleeping entirely. Only active when running on AC power.
+.TP
+\fB\-u\fR
+Simulate user activity: wakes the display (if off) and resets the idle timer.
+If \fB\-t\fR is not given, defaults to a 5-second assertion.
+.TP
+\fB\-t\fR \fItimeout\fR
+Set assertion duration in seconds. Ignored if a utility or \fB\-w\fR is used.
+.TP
+\fB\-w\fR \fIpid\fR
+Wait for the specified process ID to exit before releasing assertions.
+Ignored if a utility is provided.
+.TP
+\fB\-v\fR
+Verbose mode: show internal actions (e.g., inhibition type, fallbacks).
+.TP
+\fB\-h\fR
+Show help and exit.
+.SH EXAMPLES
+.nf
+# Prevent idle sleep until Ctrl+C
+caffeinate
+
+# Keep system awake for 30 minutes
+caffeinate -t 1800
+
+# Simulate user activity for 10 minutes (e.g., during remote session)
+caffeinate -u -t 600
+
+# Run a command with idle sleep prevented
+caffeinate -i ./backup.sh
+
+# Prevent full sleep (if on AC) until PID 1234 exits
+caffeinate -s -w 1234
+.fi
+.SH NOTES
+.IP \(bu 2
+Disk sleep prevention (\fB\-m\fR) is **not supported** on Linux due to lack of standardization.
+.IP \(bu 2
+Full sleep prevention (\fB\-s\fR) is **disabled on battery** to conserve power.
+.IP \(bu 2
+Display-related actions (\fB\-d\fR, \fB\-u\fR) are skipped in non-GUI environments (e.g., SSH).
+.SH REQUIREMENTS
+Requires:
+.RS 4
+.IP \(bu
+systemd (for \fBsystemd-inhibit\fR)
+.IP \(bu
+D-Bus session (for GNOME/KDE display control)
+.IP \(bu
+Bash 4+
+.RE
+.SH FILES
+.IP /usr/local/bin/caffeinate
+Default install location.
+.SH SEE ALSO
+.BR systemd-inhibit (1),
+.BR upower (1),
+.BR pmset (1) (macOS)
+.SH AUTHOR
+Written for Linux as an open-source reimplementation of macOS \fBcaffeinate\fR.
+.SH LICENSE
+MIT License.
