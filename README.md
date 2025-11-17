@@ -133,12 +133,6 @@ man caffeinate
 
 ---
 
-## 📄 License
-
-MIT License — free to use, modify, and distribute.
-
----
-
 ## 🙌 Inspired By
 
 - macOS [`caffeinate`](https://ss64.com/mac/caffeinate.html)
